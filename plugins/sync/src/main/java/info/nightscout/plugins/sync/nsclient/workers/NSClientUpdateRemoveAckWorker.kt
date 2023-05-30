@@ -3,6 +3,7 @@ package info.nightscout.plugins.sync.nsclient.workers
 import android.content.Context
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
+import info.nightscout.core.utils.notify
 import info.nightscout.core.utils.receivers.DataWorkerStorage
 import info.nightscout.core.utils.worker.LoggingWorker
 import info.nightscout.database.impl.AppRepository
@@ -153,6 +154,7 @@ class NSClientUpdateRemoveAckWorker(
                 ret = Result.success(workDataOf("ProcessedData" to pair.toString()))
             }
         }
+        ack.originalObject?.notify()
         return ret
     }
 }

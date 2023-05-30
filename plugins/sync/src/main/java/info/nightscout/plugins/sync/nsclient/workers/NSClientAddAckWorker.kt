@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.SystemClock
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
+import info.nightscout.core.utils.notify
 import info.nightscout.core.utils.receivers.DataWorkerStorage
 import info.nightscout.core.utils.worker.LoggingWorker
 import info.nightscout.database.impl.AppRepository
@@ -206,6 +207,7 @@ class NSClientAddAckWorker(
             }
 
         }
+        ack.originalObject?.notify()
         return ret
     }
 }

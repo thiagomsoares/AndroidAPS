@@ -1,5 +1,6 @@
 package info.nightscout.plugins.sync.nsclient
 
+import info.nightscout.core.utils.waitMillis
 import info.nightscout.database.impl.AppRepository
 import info.nightscout.interfaces.plugin.ActivePlugin
 import info.nightscout.interfaces.profile.ProfileFunction
@@ -14,6 +15,10 @@ import info.nightscout.rx.logging.AAPSLogger
 import info.nightscout.rx.logging.LTag
 import info.nightscout.shared.sharedPreferences.SP
 import info.nightscout.shared.utils.DateUtil
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -28,6 +33,7 @@ class DataSyncSelectorV1Impl @Inject constructor(
     private val rxBus: RxBus
 ) : DataSyncSelectorV1 {
 
+    private var scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     class QueueCounter(
         var bolusesRemaining: Long = -1L,
         var carbsRemaining: Long = -1L,
@@ -65,7 +71,16 @@ class DataSyncSelectorV1Impl @Inject constructor(
 
     override fun queueSize(): Long = queueCounter.size()
 
+    var running = false
+    val sync = Any()
     override suspend fun doUpload() {
+        synchronized(sync) {
+            if (running) {
+                aapsLogger.debug(LTag.NSCLIENT, "!!!!!!!!! doUpload already running")
+                return
+            }
+            running = true
+        }
         rxBus.send(EventNSClientUpdateGuiStatus())
         if (sp.getBoolean(R.string.key_ns_upload, true) && !isPaused) {
             queueCounter.bolusesRemaining = (appRepository.getLastBolusId() ?: 0L) - sp.getLong(R.string.key_ns_bolus_last_synced_id, 0)
@@ -82,22 +97,52 @@ class DataSyncSelectorV1Impl @Inject constructor(
             queueCounter.epssRemaining = (appRepository.getLastEffectiveProfileSwitchId() ?: 0L) - sp.getLong(R.string.key_ns_effective_profile_switch_last_synced_id, 0)
             queueCounter.oesRemaining = (appRepository.getLastOfflineEventId() ?: 0L) - sp.getLong(R.string.key_ns_offline_event_last_synced_id, 0)
             rxBus.send(EventNSClientUpdateGuiQueue())
-            processChangedBoluses()
-            processChangedCarbs()
-            processChangedBolusCalculatorResults()
-            processChangedTemporaryBasals()
-            processChangedExtendedBoluses()
-            processChangedProfileSwitches()
-            processChangedEffectiveProfileSwitches()
-            processChangedGlucoseValues()
-            processChangedTempTargets()
-            processChangedFoods()
-            processChangedTherapyEvents()
-            processChangedDeviceStatuses()
-            processChangedOfflineEvents()
-            processChangedProfileStore()
+            val boluses = scope.async { processChangedBoluses() }
+            val carbs = scope.async { processChangedCarbs() }
+            val bcs = scope.async { processChangedBolusCalculatorResults() }
+            val tbs = scope.async { processChangedTemporaryBasals() }
+            val ebs = scope.async { processChangedExtendedBoluses() }
+            val pss = scope.async { processChangedProfileSwitches() }
+            val epss = scope.async { processChangedEffectiveProfileSwitches() }
+            val gvs = scope.async { processChangedGlucoseValues() }
+            val tts = scope.async { processChangedTempTargets() }
+            val foods = scope.async { processChangedFoods() }
+            val tes = scope.async { processChangedTherapyEvents() }
+            val dss = scope.async { processChangedDeviceStatuses() }
+            val oes = scope.async { processChangedOfflineEvents() }
+            val ps = scope.async { processChangedProfileStore() }
+
+            boluses.await()
+            aapsLogger.debug("!!!!!!!!! bolus done")
+            carbs.await()
+            aapsLogger.debug("!!!!!!!!! carbs done")
+            bcs.await()
+            aapsLogger.debug("!!!!!!!!! bcs done")
+            tbs.await()
+            aapsLogger.debug("!!!!!!!!! tbs done")
+            ebs.await()
+            aapsLogger.debug("!!!!!!!!! ebs done")
+            pss.await()
+            aapsLogger.debug("!!!!!!!!! pss done")
+            epss.await()
+            aapsLogger.debug("!!!!!!!!! epss done")
+            gvs.await()
+            aapsLogger.debug("!!!!!!!!! gvs done")
+            tts.await()
+            aapsLogger.debug("!!!!!!!!! tts done")
+            foods.await()
+            aapsLogger.debug("!!!!!!!!! foods done")
+            tes.await()
+            aapsLogger.debug("!!!!!!!!! tes done")
+            dss.await()
+            aapsLogger.debug("!!!!!!!!! dss done")
+            oes.await()
+            aapsLogger.debug("!!!!!!!!! oes done")
+            ps.await()
+            aapsLogger.debug("!!!!!!!!! ps done")
         }
         rxBus.send(EventNSClientUpdateGuiStatus())
+        running = false
     }
 
     override fun resetToNextFullSync() {
@@ -139,6 +184,7 @@ class DataSyncSelectorV1Impl @Inject constructor(
         rxBus.send(EventNSClientUpdateGuiQueue())
         appRepository.getNextSyncElementBolus(startId).blockingGet()?.let { bolus ->
             aapsLogger.info(LTag.NSCLIENT, "Loading Bolus data Start: $startId ${bolus.first} forID: ${bolus.second.id} ")
+            val dataPair = DataSyncSelector.PairBolus(bolus.first, bolus.second.id)
             when {
                 // new record with existing NS id => must be coming from NS => ignore
                 bolus.first.id == bolus.second.id && bolus.first.interfaceIDs.nightscoutId != null -> {
@@ -155,11 +201,19 @@ class DataSyncSelectorV1Impl @Inject constructor(
                     return
                 }
                 // without nsId = create new
-                bolus.first.interfaceIDs.nightscoutId == null                                      ->
-                    activePlugin.activeNsClient?.nsAdd("treatments", DataSyncSelector.PairBolus(bolus.first, bolus.second.id), " $startId/$lastDbId")
+                bolus.first.interfaceIDs.nightscoutId == null                                      -> {
+                    activePlugin.activeNsClient?.nsAdd("treatments", dataPair, " $startId/$lastDbId")
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 1111111111 $dataPair")
+                    dataPair.waitMillis(60000)
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 2222222222 $dataPair")
+                }
                 // with nsId = update if it's modified record
-                bolus.first.interfaceIDs.nightscoutId != null && bolus.first.id != bolus.second.id ->
-                    activePlugin.activeNsClient?.nsUpdate("treatments", DataSyncSelector.PairBolus(bolus.first, bolus.second.id), "$startId/$lastDbId")
+                bolus.first.interfaceIDs.nightscoutId != null && bolus.first.id != bolus.second.id -> {
+                    activePlugin.activeNsClient?.nsUpdate("treatments", dataPair, "$startId/$lastDbId")
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 3333333333 $dataPair")
+                    dataPair.waitMillis(60000)
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 4444444444 $dataPair")
+                }
             }
             return
         }
@@ -184,6 +238,7 @@ class DataSyncSelectorV1Impl @Inject constructor(
         rxBus.send(EventNSClientUpdateGuiQueue())
         appRepository.getNextSyncElementCarbs(startId).blockingGet()?.let { carb ->
             aapsLogger.info(LTag.NSCLIENT, "Loading Carbs data Start: $startId ${carb.first} forID: ${carb.second.id} ")
+            val dataPair = DataSyncSelector.PairCarbs(carb.first, carb.second.id)
             when {
                 // new record with existing NS id => must be coming from NS => ignore
                 carb.first.id == carb.second.id && carb.first.interfaceIDs.nightscoutId != null -> {
@@ -200,15 +255,19 @@ class DataSyncSelectorV1Impl @Inject constructor(
                     return
                 }
                 // without nsId = create new
-                carb.first.interfaceIDs.nightscoutId == null                                    ->
-                    activePlugin.activeNsClient?.nsAdd("treatments", DataSyncSelector.PairCarbs(carb.first, carb.second.id), "$startId/$lastDbId")
+                carb.first.interfaceIDs.nightscoutId == null                                    -> {
+                    activePlugin.activeNsClient?.nsAdd("treatments", dataPair, "$startId/$lastDbId")
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 1111111111 $dataPair")
+                    dataPair.waitMillis(60000)
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 2222222222 $dataPair")
+                }
                 // with nsId = update if it's modified record
-                carb.first.interfaceIDs.nightscoutId != null && carb.first.id != carb.second.id ->
-                    activePlugin.activeNsClient?.nsUpdate(
-                        "treatments",
-                        DataSyncSelector.PairCarbs(carb.first, carb.second.id),
-                        "$startId/$lastDbId"
-                    )
+                carb.first.interfaceIDs.nightscoutId != null && carb.first.id != carb.second.id -> {
+                    activePlugin.activeNsClient?.nsUpdate("treatments", dataPair, "$startId/$lastDbId")
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 3333333333 $dataPair")
+                    dataPair.waitMillis(60000)
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 4444444444 $dataPair")
+                }
             }
             return
         }
@@ -233,6 +292,7 @@ class DataSyncSelectorV1Impl @Inject constructor(
         rxBus.send(EventNSClientUpdateGuiQueue())
         appRepository.getNextSyncElementBolusCalculatorResult(startId).blockingGet()?.let { bolusCalculatorResult ->
             aapsLogger.info(LTag.NSCLIENT, "Loading BolusCalculatorResult data Start: $startId ${bolusCalculatorResult.first} forID: ${bolusCalculatorResult.second.id} ")
+            val dataPair = DataSyncSelector.PairBolusCalculatorResult(bolusCalculatorResult.first, bolusCalculatorResult.second.id)
             when {
                 // new record with existing NS id => must be coming from NS => ignore
                 bolusCalculatorResult.first.id == bolusCalculatorResult.second.id && bolusCalculatorResult.first.interfaceIDs.nightscoutId != null -> {
@@ -249,11 +309,19 @@ class DataSyncSelectorV1Impl @Inject constructor(
                     return
                 }
                 // without nsId = create new
-                bolusCalculatorResult.first.interfaceIDs.nightscoutId == null                                                                      ->
-                    activePlugin.activeNsClient?.nsAdd("treatments", DataSyncSelector.PairBolusCalculatorResult(bolusCalculatorResult.first, bolusCalculatorResult.second.id), "$startId/$lastDbId")
+                bolusCalculatorResult.first.interfaceIDs.nightscoutId == null                                                                      -> {
+                    activePlugin.activeNsClient?.nsAdd("treatments", dataPair, "$startId/$lastDbId")
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 1111111111 $dataPair")
+                    dataPair.waitMillis(60000)
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 2222222222 $dataPair")
+                }
                 // with nsId = update if it's modified record
-                bolusCalculatorResult.first.interfaceIDs.nightscoutId != null && bolusCalculatorResult.first.id != bolusCalculatorResult.second.id ->
-                    activePlugin.activeNsClient?.nsUpdate("treatments", DataSyncSelector.PairBolusCalculatorResult(bolusCalculatorResult.first, bolusCalculatorResult.second.id), "$startId/$lastDbId")
+                bolusCalculatorResult.first.interfaceIDs.nightscoutId != null && bolusCalculatorResult.first.id != bolusCalculatorResult.second.id -> {
+                    activePlugin.activeNsClient?.nsUpdate("treatments", dataPair, "$startId/$lastDbId")
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 3333333333 $dataPair")
+                    dataPair.waitMillis(60000)
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 4444444444 $dataPair")
+                }
             }
             return
         }
@@ -278,6 +346,7 @@ class DataSyncSelectorV1Impl @Inject constructor(
         rxBus.send(EventNSClientUpdateGuiQueue())
         appRepository.getNextSyncElementTemporaryTarget(startId).blockingGet()?.let { tt ->
             aapsLogger.info(LTag.NSCLIENT, "Loading TemporaryTarget data Start: $startId ${tt.first} forID: ${tt.second.id} ")
+            val dataPair = DataSyncSelector.PairTemporaryTarget(tt.first, tt.second.id)
             when {
                 // new record with existing NS id => must be coming from NS => ignore
                 tt.first.id == tt.second.id && tt.first.interfaceIDs.nightscoutId != null -> {
@@ -294,11 +363,19 @@ class DataSyncSelectorV1Impl @Inject constructor(
                     return
                 }
                 // without nsId = create new
-                tt.first.interfaceIDs.nightscoutId == null                                ->
-                    activePlugin.activeNsClient?.nsAdd("treatments", DataSyncSelector.PairTemporaryTarget(tt.first, tt.second.id), "$startId/$lastDbId")
+                tt.first.interfaceIDs.nightscoutId == null                                -> {
+                    activePlugin.activeNsClient?.nsAdd("treatments", dataPair, "$startId/$lastDbId")
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 1111111111 $dataPair")
+                    dataPair.waitMillis(60000)
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 2222222222 $dataPair")
+                }
                 // existing with nsId = update
-                tt.first.interfaceIDs.nightscoutId != null                                ->
-                    activePlugin.activeNsClient?.nsUpdate("treatments", DataSyncSelector.PairTemporaryTarget(tt.first, tt.second.id), "$startId/$lastDbId")
+                tt.first.interfaceIDs.nightscoutId != null                                -> {
+                    activePlugin.activeNsClient?.nsUpdate("treatments", dataPair, "$startId/$lastDbId")
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 3333333333 $dataPair")
+                    dataPair.waitMillis(60000)
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 4444444444 $dataPair")
+                }
             }
             return
         }
@@ -323,6 +400,7 @@ class DataSyncSelectorV1Impl @Inject constructor(
         rxBus.send(EventNSClientUpdateGuiQueue())
         appRepository.getNextSyncElementFood(startId).blockingGet()?.let { food ->
             aapsLogger.info(LTag.NSCLIENT, "Loading Food data Start: $startId ${food.first} forID: ${food.second.id} ")
+            val dataPair = DataSyncSelector.PairFood(food.first, food.second.id)
             when {
                 // new record with existing NS id => must be coming from NS => ignore
                 food.first.id == food.second.id && food.first.interfaceIDs.nightscoutId != null -> {
@@ -339,11 +417,19 @@ class DataSyncSelectorV1Impl @Inject constructor(
                     return
                 }
                 // without nsId = create new
-                food.first.interfaceIDs.nightscoutId == null                                    ->
-                    activePlugin.activeNsClient?.nsAdd("food", DataSyncSelector.PairFood(food.first, food.second.id), "$startId/$lastDbId")
+                food.first.interfaceIDs.nightscoutId == null                                    -> {
+                    activePlugin.activeNsClient?.nsAdd("food", dataPair, "$startId/$lastDbId")
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 1111111111 $dataPair")
+                    dataPair.waitMillis(60000)
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 2222222222 $dataPair")
+                }
                 // with nsId = update
-                food.first.interfaceIDs.nightscoutId != null                                    ->
-                    activePlugin.activeNsClient?.nsUpdate("food", DataSyncSelector.PairFood(food.first, food.second.id), "$startId/$lastDbId")
+                food.first.interfaceIDs.nightscoutId != null                                    -> {
+                    activePlugin.activeNsClient?.nsUpdate("food", dataPair, "$startId/$lastDbId")
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 3333333333 $dataPair")
+                    dataPair.waitMillis(60000)
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 4444444444 $dataPair")
+                }
             }
             return
         }
@@ -368,6 +454,7 @@ class DataSyncSelectorV1Impl @Inject constructor(
         rxBus.send(EventNSClientUpdateGuiQueue())
         appRepository.getNextSyncElementGlucoseValue(startId).blockingGet()?.let { gv ->
             aapsLogger.info(LTag.NSCLIENT, "Loading GlucoseValue data Start: $startId ${gv.first} forID: ${gv.second.id} ")
+            val dataPair = DataSyncSelector.PairGlucoseValue(gv.first, gv.second.id)
             if (activePlugin.activeBgSource.shouldUploadToNs(gv.first)) {
                 when {
                     // new record with existing NS id => must be coming from NS => ignore
@@ -385,11 +472,19 @@ class DataSyncSelectorV1Impl @Inject constructor(
                         return
                     }
                     // without nsId = create new
-                    gv.first.interfaceIDs.nightscoutId == null                                ->
-                        activePlugin.activeNsClient?.nsAdd("entries", DataSyncSelector.PairGlucoseValue(gv.first, gv.second.id), "$startId/$lastDbId")
+                    gv.first.interfaceIDs.nightscoutId == null                                -> {
+                        activePlugin.activeNsClient?.nsAdd("entries", dataPair, "$startId/$lastDbId")
+                        aapsLogger.debug("!!!!!!!!!!!!!!!!!! 1111111111 $dataPair")
+                        dataPair.waitMillis(60000)
+                        aapsLogger.debug("!!!!!!!!!!!!!!!!!! 2222222222 $dataPair")
+                    }
                     // with nsId = update
-                    else                                                                      ->  //  gv.first.interfaceIDs.nightscoutId != null
-                        activePlugin.activeNsClient?.nsUpdate("entries", DataSyncSelector.PairGlucoseValue(gv.first, gv.second.id), "$startId/$lastDbId")
+                    else                                                                      -> { //  gv.first.interfaceIDs.nightscoutId != null
+                        activePlugin.activeNsClient?.nsUpdate("entries", dataPair, "$startId/$lastDbId")
+                        aapsLogger.debug("!!!!!!!!!!!!!!!!!! 3333333333 $dataPair")
+                        dataPair.waitMillis(60000)
+                        aapsLogger.debug("!!!!!!!!!!!!!!!!!! 4444444444 $dataPair")
+                    }
                 }
             } else {
                 confirmLastGlucoseValueIdIfGreater(gv.second.id)
@@ -418,6 +513,7 @@ class DataSyncSelectorV1Impl @Inject constructor(
         rxBus.send(EventNSClientUpdateGuiQueue())
         appRepository.getNextSyncElementTherapyEvent(startId).blockingGet()?.let { te ->
             aapsLogger.info(LTag.NSCLIENT, "Loading TherapyEvents data Start: $startId ${te.first} forID: ${te.second.id} ")
+            val dataPair = DataSyncSelector.PairTherapyEvent(te.first, te.second.id)
             when {
                 // new record with existing NS id => must be coming from NS => ignore
                 te.first.id == te.second.id && te.first.interfaceIDs.nightscoutId != null -> {
@@ -434,11 +530,19 @@ class DataSyncSelectorV1Impl @Inject constructor(
                     return
                 }
                 // without nsId = create new
-                te.first.interfaceIDs.nightscoutId == null                                ->
-                    activePlugin.activeNsClient?.nsAdd("treatments", DataSyncSelector.PairTherapyEvent(te.first, te.second.id), "$startId/$lastDbId")
+                te.first.interfaceIDs.nightscoutId == null                                -> {
+                    activePlugin.activeNsClient?.nsAdd("treatments", dataPair, "$startId/$lastDbId")
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 1111111111 $dataPair")
+                    dataPair.waitMillis(60000)
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 2222222222 $dataPair")
+                }
                 // nsId = update
-                te.first.interfaceIDs.nightscoutId != null                                ->
-                    activePlugin.activeNsClient?.nsUpdate("treatments", DataSyncSelector.PairTherapyEvent(te.first, te.second.id), "$startId/$lastDbId")
+                te.first.interfaceIDs.nightscoutId != null                                -> {
+                    activePlugin.activeNsClient?.nsUpdate("treatments", dataPair, "$startId/$lastDbId")
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 3333333333 $dataPair")
+                    dataPair.waitMillis(60000)
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 4444444444 $dataPair")
+                }
             }
             return
         }
@@ -463,10 +567,15 @@ class DataSyncSelectorV1Impl @Inject constructor(
         rxBus.send(EventNSClientUpdateGuiQueue())
         appRepository.getNextSyncElementDeviceStatus(startId).blockingGet()?.let { deviceStatus ->
             aapsLogger.info(LTag.NSCLIENT, "Loading DeviceStatus data Start: $startId $deviceStatus")
+            val dataPair = DataSyncSelector.PairDeviceStatus(deviceStatus, lastDbId)
             when {
                 // without nsId = create new
-                deviceStatus.interfaceIDs.nightscoutId == null ->
-                    activePlugin.activeNsClient?.nsAdd("devicestatus", DataSyncSelector.PairDeviceStatus(deviceStatus, lastDbId), "$startId/$lastDbId")
+                deviceStatus.interfaceIDs.nightscoutId == null -> {
+                    activePlugin.activeNsClient?.nsAdd("devicestatus", dataPair, "$startId/$lastDbId")
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 1111111111 $dataPair")
+                    dataPair.waitMillis(60000)
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 2222222222 $dataPair")
+                }
                 // with nsId = ignore
                 deviceStatus.interfaceIDs.nightscoutId != null -> Any()
             }
@@ -493,6 +602,7 @@ class DataSyncSelectorV1Impl @Inject constructor(
         rxBus.send(EventNSClientUpdateGuiQueue())
         appRepository.getNextSyncElementTemporaryBasal(startId).blockingGet()?.let { tb ->
             aapsLogger.info(LTag.NSCLIENT, "Loading TemporaryBasal data Start: $startId ${tb.first} forID: ${tb.second.id} ")
+            val dataPair = DataSyncSelector.PairTemporaryBasal(tb.first, tb.second.id)
             when {
                 // new record with existing NS id => must be coming from NS => ignore
                 tb.first.id == tb.second.id && tb.first.interfaceIDs.nightscoutId != null -> {
@@ -509,11 +619,19 @@ class DataSyncSelectorV1Impl @Inject constructor(
                     return
                 }
                 // without nsId = create new
-                tb.first.interfaceIDs.nightscoutId == null                                ->
-                    activePlugin.activeNsClient?.nsAdd("treatments", DataSyncSelector.PairTemporaryBasal(tb.first, tb.second.id), "$startId/$lastDbId")
+                tb.first.interfaceIDs.nightscoutId == null                                -> {
+                    activePlugin.activeNsClient?.nsAdd("treatments", dataPair, "$startId/$lastDbId")
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 1111111111 $dataPair")
+                    dataPair.waitMillis(60000)
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 2222222222 $dataPair")
+                }
                 // with nsId = update
-                tb.first.interfaceIDs.nightscoutId != null                                ->
-                    activePlugin.activeNsClient?.nsUpdate("treatments", DataSyncSelector.PairTemporaryBasal(tb.first, tb.second.id), "$startId/$lastDbId")
+                tb.first.interfaceIDs.nightscoutId != null                                -> {
+                    activePlugin.activeNsClient?.nsUpdate("treatments", dataPair, "$startId/$lastDbId")
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 3333333333 $dataPair")
+                    dataPair.waitMillis(60000)
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 4444444444 $dataPair")
+                }
             }
             return
         }
@@ -540,6 +658,7 @@ class DataSyncSelectorV1Impl @Inject constructor(
             aapsLogger.info(LTag.NSCLIENT, "Loading ExtendedBolus data Start: $startId ${eb.first} forID: ${eb.second.id} ")
             val profile = profileFunction.getProfile(eb.first.timestamp)
             if (profile != null) {
+                val dataPair = DataSyncSelector.PairExtendedBolus(eb.first, eb.second.id)
                 when {
                     // new record with existing NS id => must be coming from NS => ignore
                     eb.first.id == eb.second.id && eb.first.interfaceIDs.nightscoutId != null -> {
@@ -556,11 +675,19 @@ class DataSyncSelectorV1Impl @Inject constructor(
                         return
                     }
                     // without nsId = create new
-                    eb.first.interfaceIDs.nightscoutId == null                                ->
-                        activePlugin.activeNsClient?.nsAdd("treatments", DataSyncSelector.PairExtendedBolus(eb.first, eb.second.id), "$startId/$lastDbId")
+                    eb.first.interfaceIDs.nightscoutId == null                                -> {
+                        activePlugin.activeNsClient?.nsAdd("treatments", dataPair, "$startId/$lastDbId")
+                        aapsLogger.debug("!!!!!!!!!!!!!!!!!! 1111111111 $dataPair")
+                        dataPair.waitMillis(60000)
+                        aapsLogger.debug("!!!!!!!!!!!!!!!!!! 2222222222 $dataPair")
+                    }
                     // with nsId = update
-                    eb.first.interfaceIDs.nightscoutId != null                                ->
-                        activePlugin.activeNsClient?.nsUpdate("treatments", DataSyncSelector.PairExtendedBolus(eb.first, eb.second.id), "$startId/$lastDbId")
+                    eb.first.interfaceIDs.nightscoutId != null                                -> {
+                        activePlugin.activeNsClient?.nsUpdate("treatments", dataPair, "$startId/$lastDbId")
+                        aapsLogger.debug("!!!!!!!!!!!!!!!!!! 3333333333 $dataPair")
+                        dataPair.waitMillis(60000)
+                        aapsLogger.debug("!!!!!!!!!!!!!!!!!! 4444444444 $dataPair")
+                    }
                 }
                 return
             } else {
@@ -591,6 +718,7 @@ class DataSyncSelectorV1Impl @Inject constructor(
         rxBus.send(EventNSClientUpdateGuiQueue())
         appRepository.getNextSyncElementProfileSwitch(startId).blockingGet()?.let { ps ->
             aapsLogger.info(LTag.NSCLIENT, "Loading ProfileSwitch data Start: $startId ${ps.first} forID: ${ps.second.id} ")
+            val dataPair = DataSyncSelector.PairProfileSwitch(ps.first, ps.second.id)
             when {
                 // new record with existing NS id => must be coming from NS => ignore
                 ps.first.id == ps.second.id && ps.first.interfaceIDs.nightscoutId != null -> {
@@ -607,11 +735,19 @@ class DataSyncSelectorV1Impl @Inject constructor(
                     return
                 }
                 // without nsId = create new
-                ps.first.interfaceIDs.nightscoutId == null                                ->
-                    activePlugin.activeNsClient?.nsAdd("treatments", DataSyncSelector.PairProfileSwitch(ps.first, ps.second.id), "$startId/$lastDbId")
+                ps.first.interfaceIDs.nightscoutId == null                                -> {
+                    activePlugin.activeNsClient?.nsAdd("treatments", dataPair, "$startId/$lastDbId")
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 1111111111 $dataPair")
+                    dataPair.waitMillis(60000)
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 2222222222 $dataPair")
+                }
                 // with nsId = update
-                ps.first.interfaceIDs.nightscoutId != null                                ->
-                    activePlugin.activeNsClient?.nsUpdate("treatments", DataSyncSelector.PairProfileSwitch(ps.first, ps.second.id), "$startId/$lastDbId")
+                ps.first.interfaceIDs.nightscoutId != null                                -> {
+                    activePlugin.activeNsClient?.nsUpdate("treatments", dataPair, "$startId/$lastDbId")
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 3333333333 $dataPair")
+                    dataPair.waitMillis(60000)
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 4444444444 $dataPair")
+                }
             }
             return
         }
@@ -636,6 +772,7 @@ class DataSyncSelectorV1Impl @Inject constructor(
         rxBus.send(EventNSClientUpdateGuiQueue())
         appRepository.getNextSyncElementEffectiveProfileSwitch(startId).blockingGet()?.let { ps ->
             aapsLogger.info(LTag.NSCLIENT, "Loading EffectiveProfileSwitch data Start: $startId ${ps.first} forID: ${ps.second.id} ")
+            val dataPair = DataSyncSelector.PairEffectiveProfileSwitch(ps.first, ps.second.id)
             when {
                 // new record with existing NS id => must be coming from NS => ignore
                 ps.first.id == ps.second.id && ps.first.interfaceIDs.nightscoutId != null -> {
@@ -652,11 +789,19 @@ class DataSyncSelectorV1Impl @Inject constructor(
                     return
                 }
                 // without nsId = create new
-                ps.first.interfaceIDs.nightscoutId == null                                ->
-                    activePlugin.activeNsClient?.nsAdd("treatments", DataSyncSelector.PairEffectiveProfileSwitch(ps.first, ps.second.id), "$startId/$lastDbId")
+                ps.first.interfaceIDs.nightscoutId == null                                -> {
+                    activePlugin.activeNsClient?.nsAdd("treatments", dataPair, "$startId/$lastDbId")
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 1111111111 $dataPair")
+                    dataPair.waitMillis(60000)
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 2222222222 $dataPair")
+                }
                 // with nsId = update
-                ps.first.interfaceIDs.nightscoutId != null                                ->
-                    activePlugin.activeNsClient?.nsUpdate("treatments", DataSyncSelector.PairEffectiveProfileSwitch(ps.first, ps.second.id), "$startId/$lastDbId")
+                ps.first.interfaceIDs.nightscoutId != null                                -> {
+                    activePlugin.activeNsClient?.nsUpdate("treatments", dataPair, "$startId/$lastDbId")
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 3333333333 $dataPair")
+                    dataPair.waitMillis(60000)
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 4444444444 $dataPair")
+                }
             }
             return
         }
@@ -681,6 +826,7 @@ class DataSyncSelectorV1Impl @Inject constructor(
         rxBus.send(EventNSClientUpdateGuiQueue())
         appRepository.getNextSyncElementOfflineEvent(startId).blockingGet()?.let { oe ->
             aapsLogger.info(LTag.NSCLIENT, "Loading OfflineEvent data Start: $startId ${oe.first} forID: ${oe.second.id} ")
+            val dataPair = DataSyncSelector.PairOfflineEvent(oe.first, oe.second.id)
             when {
                 // new record with existing NS id => must be coming from NS => ignore
                 oe.first.id == oe.second.id && oe.first.interfaceIDs.nightscoutId != null -> {
@@ -697,11 +843,19 @@ class DataSyncSelectorV1Impl @Inject constructor(
                     return
                 }
                 // without nsId = create new
-                oe.first.interfaceIDs.nightscoutId == null                                ->
-                    activePlugin.activeNsClient?.nsAdd("treatments", DataSyncSelector.PairOfflineEvent(oe.first, oe.second.id), "$startId/$lastDbId")
+                oe.first.interfaceIDs.nightscoutId == null                                -> {
+                    activePlugin.activeNsClient?.nsAdd("treatments", dataPair, "$startId/$lastDbId")
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 1111111111 $dataPair")
+                    dataPair.waitMillis(60000)
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 2222222222 $dataPair")
+                }
                 // existing with nsId = update
-                oe.first.interfaceIDs.nightscoutId != null                                ->
-                    activePlugin.activeNsClient?.nsUpdate("treatments", DataSyncSelector.PairOfflineEvent(oe.first, oe.second.id), "$startId/$lastDbId")
+                oe.first.interfaceIDs.nightscoutId != null                                -> {
+                    activePlugin.activeNsClient?.nsUpdate("treatments", dataPair, "$startId/$lastDbId")
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 3333333333 $dataPair")
+                    dataPair.waitMillis(60000)
+                    aapsLogger.debug("!!!!!!!!!!!!!!!!!! 4444444444 $dataPair")
+                }
             }
             return
         }
@@ -723,7 +877,11 @@ class DataSyncSelectorV1Impl @Inject constructor(
             // add for v3
             if (JsonHelper.safeGetLongAllowNull(profileJson, "date") == null)
                 profileJson.put("date", profileStore.getStartDate())
-            activePlugin.activeNsClient?.nsAdd("profile", DataSyncSelector.PairProfileStore(profileJson, dateUtil.now()), "")
+            val dataPair = DataSyncSelector.PairProfileStore(profileJson, dateUtil.now())
+            activePlugin.activeNsClient?.nsAdd("profile", dataPair, "")
+            aapsLogger.debug("!!!!!!!!!!!!!!!!!! 1111111111 $dataPair")
+            dataPair.waitMillis(60000)
+            aapsLogger.debug("!!!!!!!!!!!!!!!!!! 2222222222 $dataPair")
         }
     }
 }
